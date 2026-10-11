@@ -335,7 +335,9 @@ def _plan_marker(record: dict | None, now: float) -> str:
 
 
 def _usage_entry_lines(
-    entry: UsageEntry, login_expires_at: float | None = None
+    entry: UsageEntry,
+    login_expires_at: float | None = None,
+    budget_line: str | None = None,
 ) -> list[str]:
     """Styled usage lines (sans indent) for one account's entry.
 
@@ -358,6 +360,8 @@ def _usage_entry_lines(
             children.append(muted(last_seen))
         if login_line is not None:
             children.append(login_line)
+        if budget_line and entry.sentinel == USAGE_API_KEY:
+            children.append(muted(budget_line))
         out.extend(
             f"{dimmed('└' if j == len(children) - 1 else '├')} {line}"
             for j, line in enumerate(children)
@@ -2127,6 +2131,7 @@ class ClaudeAccountSwitcher:
             for num in data.get("sequence", [])
             if self._account_is_switchable(str(num))
             and not self._disabled_from_data(data, str(num))
+            and not self.api_budget_blocked(str(num))
         ]
 
     @staticmethod
@@ -2389,6 +2394,42 @@ class ClaudeAccountSwitcher:
                 )
         else:
             print(dimmed("  It is back in the rotation."))
+
+    @property
+    def api_budgets(self):
+        """Prepaid-credit budgets for API-key slots (``api-budgets.json``)."""
+        budgets = getattr(self, "_api_budgets", None)
+        if budgets is None:
+            from claude_swap.api_budget import ApiBudgets
+
+            def _slot_key(slot: str) -> str:
+                creds = self._read_account_credentials(slot, self.account_email(slot)) if slot else ""
+                return creds.strip() if looks_like_api_key(creds) else ""
+
+            budgets = self._api_budgets = ApiBudgets(self.sequence_file.parent, _slot_key)
+        return budgets
+
+    def api_budget_blocked(self, account_num: str) -> bool:
+        """An API-key slot whose prepaid credit is exhausted (≥ cap) or expired."""
+        if self._account_kind(str(account_num)) != "api_key":
+            return False
+        try:
+            st = self.api_budgets.status(str(account_num))
+        except Exception:  # never let a budget read break rotation; fail open
+            self._logger.warning("API budget read failed for %s", account_num, exc_info=True)
+            return False
+        return bool(st and st.blocked)
+
+    def _budget_line(self, account_num: str, entry: UsageEntry) -> str | None:
+        if entry.sentinel != USAGE_API_KEY:
+            return None
+        try:
+            from claude_swap.api_budget import describe
+
+            st = self.api_budgets.status(str(account_num))
+        except Exception:  # display must never break `list`
+            return None
+        return describe(st) if st else None
 
     def account_kind_for(self, account_num: str) -> str:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
@@ -6299,7 +6340,11 @@ class ClaudeAccountSwitcher:
             markers += _plan_marker(plans.get(str(num)), self._usage_store.clock())
             print(f"  {num}: {label}{tag}{markers}")
             login_expires_at = oauth.login_expires_at_epoch(creds)
-            for line in _usage_entry_lines(entries[str(num)], login_expires_at):
+            for line in _usage_entry_lines(
+                entries[str(num)],
+                login_expires_at,
+                self._budget_line(str(num), entries[str(num)]),
+            ):
                 print(f"     {line}")
 
             if show_token_status:
@@ -6469,7 +6514,9 @@ class ClaudeAccountSwitcher:
             entry, login_expires_at = self._active_account_usage(
                 account_num, current_email, current_org_uuid
             )
-            for line in _usage_entry_lines(entry, login_expires_at):
+            for line in _usage_entry_lines(
+                entry, login_expires_at, self._budget_line(account_num, entry)
+            ):
                 print(f"  {line}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
