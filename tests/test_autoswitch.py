@@ -7581,14 +7581,15 @@ class TestHardThreshold:
         for n, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
             h.seed(n, email)
         h.make_live("a@example.com", 1)
-        h.tick_with_usage({
+        outcome = h.tick_with_usage({
             "1": _usage(99, self._at(h, 2 * 3600)),
             "2": _usage(100, self._at(h, 600)),
             "3": _usage(95, self._at(h, 480)),
         })
-        assert not any(
-            isinstance(e, SwitchEvent) and e.trigger == "hard-limit" for e in h.events
-        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
 
     def test_fallback_still_respects_the_cooldown(self, temp_home):
         h = EngineHarness(temp_home, threshold=90.0, hard_threshold=95.0)
