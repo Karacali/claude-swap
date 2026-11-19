@@ -41,6 +41,15 @@ class AutoSwitchSettings:
     re-triggers next tick) and beat the active account's utilization by at
     least ``hysteresis_pct``, so two accounts hovering at the line never
     ping-pong while a strictly better account is always taken.
+
+    ``hard_threshold`` (off by default) is a second, blunter line. Between the
+    threshold and 100% the proactive rules may deliberately hold — e.g. when
+    every peer is also over the threshold they sit where quota returns first.
+    At or above ``hard_threshold`` the engine instead escapes to the account
+    with the most headroom, as long as it beats the active one by
+    ``hysteresis_pct``, ignoring the cooldown, the recovery ranking and the
+    no-return bar. When nothing clears that margin, the proactive rules decide
+    as before.
     """
 
     threshold: float = 90.0
@@ -57,6 +66,7 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    hard_threshold: float | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +144,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "hardThreshold", "hard_threshold", "float", 50.0, 100.0,
+            help="At this pct, escape to the roomiest account even if every peer is over the threshold (off by default)",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -431,6 +445,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("hard_threshold", "hard_threshold"),
     ):
         value = getattr(args, attr, None)
         if value is not None:

@@ -355,3 +355,11 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+def test_hard_threshold_defaults_off_and_round_trips(tmp_path):
+    from claude_swap.settings import load_settings, set_setting
+
+    assert load_settings(tmp_path).hard_threshold is None
+    assert set_setting(tmp_path, "autoswitch.hardThreshold", "95") == 95.0
+    assert load_settings(tmp_path).hard_threshold == 95.0

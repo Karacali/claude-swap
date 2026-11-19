@@ -604,6 +604,7 @@ Exit codes with --once:
 Examples:
   cswap auto                       # foreground loop, switch at 90%% used
   cswap auto --threshold 80        # switch earlier
+  cswap auto --hard-threshold 95   # never ride past 95%% while a roomier account exists
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
@@ -635,6 +636,15 @@ Defaults live in settings.json in the backup root; flags override them.
         help=(
             "Switch when the active account's binding 5h/7d window reaches "
             "this utilization (50-99.9; default 90)"
+        ),
+    )
+    parser.add_argument(
+        "--hard-threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "At this utilization, escape to the account with the most quota "
+            "left even when every peer is over --threshold (50-100; default off)"
         ),
     )
     parser.add_argument(
@@ -723,10 +733,15 @@ Defaults live in settings.json in the backup root; flags override them.
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
         if not args.json:
+            hard = (
+                f"hard {settings.hard_threshold:.0f}%, "
+                if settings.hard_threshold is not None
+                else ""
+            )
             print(
                 dimmed(
                     f"Auto-switch running: threshold {settings.threshold:.0f}%, "
-                    f"every {settings.interval_seconds:.0f}s"
+                    f"{hard}every {settings.interval_seconds:.0f}s"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )

@@ -362,7 +362,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "hard-limit" | "at-limit" | "failover" | "consume-first"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -996,8 +996,20 @@ class AutoSwitchEngine:
                 # most-perishable quota first. Candidate selection decides whether
                 # a sooner-resetting account with room actually exists.
                 trigger = "consume-first"
+            elif active_headroom <= 0:
+                trigger = "at-limit"
+            elif (
+                settings.hard_threshold is not None
+                and utilization >= settings.hard_threshold
+            ):
+                # Opt-in second line: escape to the roomiest peer before the
+                # limit lands, rather than letting the proactive rules hold
+                # (they may, e.g. ranking an all-over-threshold fleet by
+                # soonest reset). Falls back to proactive below when nothing
+                # clears the hysteresis margin.
+                trigger = "hard-limit"
             else:
-                trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                trigger = "proactive"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1217,11 +1229,38 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        # Captured before the hard-limit → proactive downgrade below: the API-key
+        # last resort keys off how close the ACTIVE subscription is to its limit.
+        must_move_trigger = trigger if trigger in ("at-limit", "hard-limit") else None
+
+        if trigger == "hard-limit" and not ordered:
+            # Nobody is meaningfully roomier: let the ordinary proactive rules
+            # (cooldown, recovery ranking, no-return bar) decide instead.
+            trigger = "proactive"
+            if self._in_cooldown(state):
+                self._emit(NoSwitchEvent(reason="cooldown"))
+                return TickOutcome.NO_ACTION
+            ordered, any_known, active_reset_ts = _rank(
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+            )
+
+        if not ordered and api_key_candidates and must_move_trigger:
             # Last resort when we must move: metered API-key accounts
-            # (unmeasurable headroom). Never for a below-threshold consume-first
-            # nudge — those API-key accounts have no weekly window to consume.
+            # (unmeasurable headroom). Only once the active subscription is
+            # actually at (or past the hard threshold toward) its limit — never
+            # for a proactive/consume-first nudge, which would start paying while
+            # subscription quota is left, nor for a usage-unknown failover, which
+            # a merely-unreadable (429ing) usage endpoint can trigger.
             ordered = api_key_candidates
+            trigger = must_move_trigger
 
         if not ordered:
             if not any_known:
@@ -1913,6 +1952,12 @@ class AutoSwitchEngine:
                     # qualifies; near-line pairs can't flap back).
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
+            elif trigger == "hard-limit":
+                # Escape, not optimisation — but still one-way: the target must
+                # beat the active by the hysteresis margin, so the account we
+                # leave can never qualify straight back.
+                if h - (active_headroom or 0.0) < settings.hysteresis_pct:
+                    continue
             if all_above and trigger in ("proactive", "consume-first"):
                 # Ranked on the axis its own gate decided, and TIERED so the two
                 # stay comparable: a candidate returning inside the horizon
