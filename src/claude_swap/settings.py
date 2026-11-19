@@ -58,6 +58,15 @@ class AutoSwitchSettings:
     account is always taken. Under the ``consume-first`` strategy
     ``hysteresis_pct`` is instead the room a landing needs: that many points
     left under each of the target's own lines (``lines.line_room``).
+
+    ``hard_threshold`` (off by default) is a second, blunter line. Past the
+    threshold the proactive rules may deliberately hold — the cooldown, the
+    no-return bar, or a ranking that finds no candidate clearing its margin.
+    At or above ``hard_threshold`` raw utilization the engine instead escapes
+    to the account with the most headroom (under-line accounts first), as long
+    as it beats the active one by ``hysteresis_pct`` raw points, ignoring the
+    cooldown and the no-return bar. When nothing clears that margin, the
+    proactive rules decide as before. Not used by the priority strategies.
     """
 
     threshold: float = 90.0
@@ -77,6 +86,8 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Raw-utilization escape line above ``threshold``; None = off (default).
+    hard_threshold: float | None = None
 
 
 @dataclass(frozen=True)
@@ -180,6 +191,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "weeklyThreshold", "weekly_threshold", "float", 50.0, 99.9,
             help="Switch line for the 7d and per-model windows (unset: threshold)",
+        ),
+        SettingSpec(
+            "autoswitch", "hardThreshold", "hard_threshold", "float", 50.0, 100.0,
+            help="At this pct, escape to the roomiest account even past the cooldown (off by default)",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
@@ -730,6 +745,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     for attr, field in (
         ("threshold", "threshold"),
         ("weekly_threshold", "weekly_threshold"),
+        ("hard_threshold", "hard_threshold"),
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),

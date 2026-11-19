@@ -339,7 +339,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "priority"
+    trigger: str  # "proactive" | "hard-limit" | "at-limit" | "failover" | "consume-first" | "priority"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -1212,9 +1212,22 @@ class AutoSwitchEngine:
                 # most-perishable quota first. Candidate selection decides whether
                 # a sooner-resetting account with room actually exists.
                 trigger = "priority" if priority_mode else "consume-first"
-            else:
+            elif active_headroom <= 0:
                 # Exhaustion is physical: at-limit reads the raw headroom.
-                trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                trigger = "at-limit"
+            elif (
+                settings.hard_threshold is not None
+                and not priority_mode
+                and 100.0 - active_headroom >= settings.hard_threshold
+            ):
+                # Opt-in second line, on raw utilization like at-limit: escape
+                # to the roomiest peer before the limit lands, rather than
+                # letting the proactive rules hold (cooldown, no-return bar, a
+                # ranking that finds nobody clearing its margin). Falls back to
+                # proactive below when nothing clears the hysteresis margin.
+                trigger = "hard-limit"
+            else:
+                trigger = "proactive"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1451,21 +1464,47 @@ class AutoSwitchEngine:
                 thresholds=thresholds,
             )
 
+        # Captured before the hard-limit -> proactive downgrade below: the API-key
+        # last resort keys off how close the ACTIVE subscription is to its limit.
+        must_move_trigger = trigger if trigger in ("at-limit", "hard-limit") else None
+
+        if trigger == "hard-limit" and not ordered:
+            # Nobody is meaningfully roomier: let the ordinary proactive rules
+            # (cooldown, ranking, no-return bar) decide instead.
+            trigger = "proactive"
+            if self._in_cooldown(state):
+                self._emit(NoSwitchEvent(reason="cooldown"))
+                return TickOutcome.NO_ACTION
+            ordered, any_known, active_reset_ts = _rank(
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+                thresholds=thresholds,
+            )
+
         priority_active_ready = priority_mode and current in switchable and self._priority_ready(
             usage.get(current), headroom.get(current), settings, thresholds[current]
         )
         if (
             not ordered and api_key_candidates
-            and trigger == "at-limit"
+            and must_move_trigger is not None
             and not priority_active_ready
         ):
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Only once the active subscription is
-            # actually at its limit — never for a proactive or consume-first
+            # actually at (or past the hard threshold toward) its limit — never
+            # for a proactive or consume-first
             # nudge, which would start paying while subscription quota is left,
             # nor for a usage-unknown failover, which a merely unreadable (e.g.
             # 429ing) usage endpoint can trigger.
             ordered = api_key_candidates
+            trigger = must_move_trigger
 
         if not ordered:
             if priority_active_ready:
@@ -2201,7 +2240,7 @@ class AutoSwitchEngine:
         over_by_account = {
             num: (b.over if b is not None else None) for num, b in bindings.items()
         }
-        if trigger in ("at-limit", "failover"):
+        if trigger in ("at-limit", "failover", "hard-limit"):
             all_above = _every_candidate_above_threshold(
                 oauth_candidates, over_by_account
             )
@@ -2297,6 +2336,12 @@ class AutoSwitchEngine:
                     # would park on the account about to hit its limit.
                     if lh - active_lh < settings.hysteresis_pct:
                         continue
+            elif trigger == "hard-limit":
+                # Escape, not optimisation, but still one-way: the target must
+                # beat the active by the hysteresis margin in raw points, so
+                # the account we leave can never qualify straight back.
+                if h - (active_headroom or 0.0) < settings.hysteresis_pct:
+                    continue
             if all_above:
                 # Every trigger, escapes included: at-limit and failover skip
                 # the gate above, but an escape sorting by consume-first's
@@ -2320,6 +2365,10 @@ class AutoSwitchEngine:
                 key = (tight, reset_ts if reset_ts is not None else float("inf"), -lh)
             else:
                 key = (-lh,)
+            if trigger == "hard-limit" and not all_above:
+                # The roomiest account, one still under its lines first (one
+                # over a line would be left again at the next cooldown).
+                key = (over, *most_room(num, h))
             if trigger in ("at-limit", "failover") and not all_above:
                 # Escapes skip the landing gate on purpose (any account with
                 # real headroom beats a dead one) but must still prefer a target

@@ -1944,6 +1944,19 @@ class TestApiKeyAccounts:
         h.tick_with_usage({"1": _usage(pct), "2": "api key", "3": _usage(100)})
         assert h.active_number() == 1
 
+    def test_api_key_used_past_hard_threshold(self, temp_home):
+        h = EngineHarness(temp_home, include_api_key_accounts=True, hard_threshold=95.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        outcome = h.tick_with_usage({"1": _usage(96), "2": "api key", "3": _usage(100)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "hard-limit"
+
     def test_api_key_not_used_on_usage_unknown_failover(self, temp_home):
         h = EngineHarness(temp_home, include_api_key_accounts=True)
         h.seed(1, "a@example.com")
@@ -7492,3 +7505,115 @@ class TestHeaderProbeReadings:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
+
+
+class TestHardThreshold:
+    """Opt-in second line of defence: at ``hard_threshold`` raw utilization,
+    escape to the roomiest peer instead of letting the proactive rules hold
+    (cooldown, no-return bar, a ranking that finds nobody clearing its margin).
+    """
+
+    def _at(self, harness, seconds: float) -> str:
+        return _iso_at(harness.clock.now + seconds)
+
+    def _harness(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, threshold=75.0, **kw)
+        for n, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            h.seed(n, email)
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _measured(self, h) -> dict:
+        return {
+            "1": _usage(91, self._at(h, 2 * 3600)),               # active, 9 left
+            "2": _usage7(47, 75, self._at(h, 5 * 86400)),         # 25 left, days out
+            "3": _usage7(13, 78, self._at(h, int(2.5 * 3600))),   # 22 left
+        }
+
+    def _left_three(self, h) -> None:
+        # The engine just moved 3 -> 1: inside the cooldown, 3 is barred.
+        h.engine._mutate_state(lambda s: s.update(
+            lastSwitchAt=h.clock(), lastSwitchFrom=3, lastSwitchTo="1",
+            leftHeadroom=22.0, leftTrigger="proactive",
+        ))
+
+    def test_off_by_default_the_cooldown_holds(self, temp_home):
+        h = self._harness(temp_home)
+        self._left_three(h)
+        assert h.tick_with_usage(self._measured(h)) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == ["cooldown"]
+
+    def test_escapes_to_the_roomiest_peer_inside_the_cooldown(self, temp_home):
+        h = self._harness(temp_home, hard_threshold=90.0)
+        self._left_three(h)
+        outcome = h.tick_with_usage(self._measured(h))
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "hard-limit"
+
+    def test_below_the_hard_line_the_cooldown_still_holds(self, temp_home):
+        h = self._harness(temp_home, hard_threshold=95.0)
+        self._left_three(h)
+        assert h.tick_with_usage(self._measured(h)) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_prefers_an_under_line_peer_over_a_roomier_over_line_one(self, temp_home):
+        # Weekly line 60: account 2 (7d 65%) has the most raw room (35) but is
+        # over its weekly line, so it would be left again at the next
+        # cooldown; account 3 (5h 70%, 30 left) is under every line.
+        h = self._harness(temp_home, hard_threshold=90.0, weekly_threshold=60.0)
+        outcome = h.tick_with_usage({
+            "1": _usage(95),
+            "2": _usage7(10, 65),
+            "3": _usage7(70, 0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "hard-limit"
+
+    def test_no_meaningfully_roomier_peer_falls_back_to_proactive(self, temp_home):
+        """Active 99, peers 100 and 95: nobody beats it by the hysteresis
+        margin, so the proactive rules decide as before."""
+        h = EngineHarness(temp_home, threshold=90.0, hard_threshold=95.0)
+        for n, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            h.seed(n, email)
+        h.make_live("a@example.com", 1)
+        h.tick_with_usage({
+            "1": _usage(99, self._at(h, 2 * 3600)),
+            "2": _usage(100, self._at(h, 600)),
+            "3": _usage(95, self._at(h, 480)),
+        })
+        assert not any(
+            isinstance(e, SwitchEvent) and e.trigger == "hard-limit" for e in h.events
+        )
+
+    def test_fallback_still_respects_the_cooldown(self, temp_home):
+        h = EngineHarness(temp_home, threshold=90.0, hard_threshold=95.0)
+        for n, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            h.seed(n, email)
+        h.make_live("a@example.com", 1)
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock()))
+        outcome = h.tick_with_usage({
+            "1": _usage(99, self._at(h, 2 * 3600)),
+            "2": _usage(100, self._at(h, 600)),
+            "3": _usage(95, self._at(h, 480)),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == ["cooldown"]
+
+    def test_the_account_left_cannot_qualify_straight_back(self, temp_home):
+        h = self._harness(temp_home, hard_threshold=90.0)
+        assert h.tick_with_usage({
+            "1": _usage(92), "2": _usage(60), "3": _usage(100),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.make_live("b@example.com", 2)
+        # Account 2 burns to the hard line; 1 is still worse than it.
+        h.clock.advance(60)
+        assert h.tick_with_usage({
+            "1": _usage(92), "2": _usage(91), "3": _usage(100),
+        }) is not TickOutcome.SWITCHED
+        assert h.active_number() == 2

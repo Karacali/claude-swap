@@ -811,6 +811,7 @@ Examples:
   cswap auto                       # foreground loop, switch at 90% used
   cswap auto --threshold 80        # switch earlier
   cswap auto --weekly-threshold 97 # let the weekly window run higher before switching
+  cswap auto --hard-threshold 98   # never ride past 98% while a roomier account exists
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
@@ -853,6 +854,15 @@ Defaults live in settings.json in the backup root; flags override them.
             "Separate switch line for the 7-day and per-model weekly windows "
             "(50-99.9; default: the threshold). A flag cannot unset a "
             "configured value; use 'cswap config unset'"
+        ),
+    )
+    parser.add_argument(
+        "--hard-threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "At this utilization, escape to the account with the most quota "
+            "left even inside the cooldown (50-100; default off)"
         ),
     )
     parser.add_argument(
@@ -950,6 +960,8 @@ Defaults live in settings.json in the backup root; flags override them.
                 if settings.weekly_threshold is not None
                 else ""
             )
+            if settings.hard_threshold is not None:
+                weekly += f", hard {pct_label(settings.hard_threshold)}%"
             print(
                 dimmed(
                     f"Auto-switch running: threshold {pct_label(settings.threshold)}%"

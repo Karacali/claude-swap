@@ -754,3 +754,11 @@ class TestWeeklyThreshold:
     def test_cli_value_is_clamped(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(weekly_threshold=970.0))
         assert merged.weekly_threshold == 99.9
+
+
+def test_hard_threshold_defaults_off_and_round_trips(tmp_path):
+    from claude_swap.settings import load_settings, set_setting
+
+    assert load_settings(tmp_path).hard_threshold is None
+    assert set_setting(tmp_path, "autoswitch.hardThreshold", "95") == 95.0
+    assert load_settings(tmp_path).hard_threshold == 95.0
